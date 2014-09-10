@@ -3,11 +3,8 @@
 namespace nsqphp\Wire;
 
 use nsqphp\Connection\ConnectionInterface;
-use nsqphp\Message\Message;
 use nsqphp\Exception\SocketException;
 use nsqphp\Exception\ReadException;
-use nsqphp\Exception\ErrorFrameException;
-use nsqphp\Exception\ResponseFrameException;
 use nsqphp\Exception\UnknownFrameException;
 
 class Reader

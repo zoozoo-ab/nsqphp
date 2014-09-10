@@ -4,14 +4,7 @@ namespace nsqphp\Connection;
 
 interface ConnectionInterface
 {
-    /**
-     * Wait for readable
-     * 
-     * Waits for the socket to become readable (eg: have some data waiting)
-     * 
-     * @return boolean
-     */
-    public function isReadable();
+    public function close();
 
     /**
      * Read from the socket exactly $len bytes

@@ -2,16 +2,18 @@
 
 namespace nsqphp;
 
+use nsqphp\Event\Event;
+use nsqphp\Event\Events;
+use nsqphp\Event\MessageErrorEvent;
+use nsqphp\Event\MessageEvent;
 use React\EventLoop\LoopInterface;
 use React\EventLoop\Factory as ELFactory;
 
-use nsqphp\Logger\LoggerInterface;
 use nsqphp\Lookup\LookupInterface;
 use nsqphp\Connection\ConnectionInterface;
-use nsqphp\Dedupe\DedupeInterface;
-use nsqphp\RequeueStrategy\RequeueStrategyInterface;
 use nsqphp\Message\MessageInterface;
 use nsqphp\Message\Message;
+use Symfony\Component\EventDispatcher\EventDispatcherInterface;
 
 class nsqphp
 {
@@ -28,28 +30,7 @@ class nsqphp
      * @var LookupInterface|NULL
      */
     private $nsLookup;
-    
-    /**
-     * Dedupe service
-     * 
-     * @var DedupeInterface|NULL
-     */
-    private $dedupe;
-    
-    /**
-     * Requeue strategy
-     * 
-     * @var RequeueStrategyInterface|NULL
-     */
-    private $requeueStrategy;
-    
-    /**
-     * Logger, if any enabled
-     * 
-     * @var LoggerInterface|NULL
-     */
-    private $logger;
-    
+
     /**
      * Connection timeout - in seconds
      * 
@@ -126,32 +107,30 @@ class nsqphp
      * @var string
      */
     private $shortId;
+
+    /**
+     * @var bool
+     */
+    private $running = false;
+
+    /**
+     * @var EventDispatcherInterface
+     */
+    private $eventDispatcher;
     
     /**
      * Constructor
      * 
      * @param LookupInterface|NULL $nsLookup Lookup service for hosts from topic (optional)
      *      NB: $nsLookup service _is_ required for subscription
-     * @param DedupeInterface|NULL $dedupe Deduplication service (optional)
-     * @param RequeueStrategyInterface|NULL $requeueStrategy Our strategy
-     *      for dealing with failures whilst processing SUBbed messages via
-     *      callback - if any (optional)
-       @param LoggerInterface|NULL $logger Logging service (optional)
      */
     public function __construct(
-            LookupInterface $nsLookup = NULL,
-            DedupeInterface $dedupe = NULL,
-            RequeueStrategyInterface $requeueStrategy = NULL,
-            LoggerInterface $logger = NULL,
-            $connectionTimeout = 3,
-            $readWriteTimeout = 3,
-            $readWaitTimeout = 15
-            )
-    {
+        LookupInterface $nsLookup = NULL,
+        $connectionTimeout = 3,
+        $readWriteTimeout = 3,
+        $readWaitTimeout = 15
+    ) {
         $this->nsLookup = $nsLookup;
-        $this->dedupe = $dedupe;
-        $this->requeueStrategy = $requeueStrategy;
-        $this->logger = $logger;
         
         $this->connectionTimeout = $connectionTimeout;
         $this->readWriteTimeout = $readWriteTimeout;
@@ -172,15 +151,32 @@ class nsqphp
     }
 
     /**
-     * Set requeue strategy
-     *
-     * @param \nsqphp\RequeueStrategy\RequeueStrategyInterface $requeueStrategy
+     * @param EventDispatcherInterface $eventDispatcher
      */
-    public function setRequeueStrategy(RequeueStrategyInterface $requeueStrategy = NULL)
+    public function setEventDispatcher(EventDispatcherInterface $eventDispatcher)
     {
-        $this->requeueStrategy = $requeueStrategy;
+        $this->eventDispatcher = $eventDispatcher;
     }
-    
+
+    /**
+     * @return EventDispatcherInterface
+     */
+    public function getEventDispatcher()
+    {
+        return $this->eventDispatcher;
+    }
+
+    /**
+     * @param string $eventName
+     * @param Event  $event
+     */
+    protected function dispatchEvent($eventName, Event $event)
+    {
+        if ($this->eventDispatcher) {
+            $this->eventDispatcher->dispatch($eventName, $event);
+        }
+    }
+
     /**
      * Destructor
      */
@@ -189,9 +185,6 @@ class nsqphp
         // say goodbye to each connection
         foreach ($this->subConnectionPool as $connection) {
             $connection->write($this->writer->close());
-            if ($this->logger) {
-                $this->logger->info(sprintf('nsqphp closing [%s]', (string)$connection));
-            }
         }
     }
     
@@ -231,11 +224,12 @@ class nsqphp
                     $this->connectionTimeout,
                     $this->readWriteTimeout,
                     $this->readWaitTimeout,
-                    FALSE,      // blocking
-                    array($this, 'connectionCallback')
+                    FALSE      // blocking
                     );
             $this->pubConnectionPool->add($conn);
         }
+
+        $this->publisher = new NsqPublisher($conn, 0);
         
         // work out success count
         if ($cl === NULL) {
@@ -273,34 +267,8 @@ class nsqphp
      */
     public function publish($topic, MessageInterface $msg)
     {
-        // pick a random
-        $this->pubConnectionPool->shuffle();
-        
-        $success = 0;
-        $errors = array();
-        foreach ($this->pubConnectionPool as $conn) {
-            try {
-                $conn->write($this->writer->publish($topic, $msg->getPayload()));
-                $frame = $this->reader->readFrame($conn);
-                if ($this->reader->frameIsResponse($frame, 'OK')) {
-                    $success++;
-                } else {
-                    $errors[] = $frame['error'];
-                }
-            } catch (\Exception $e) {
-                $errors[] = $e->getMessage();
-            }
-            if ($success >= $this->pubSuccessCount) {
-                break;
-            }
-        }
-        
-        if ($success < $this->pubSuccessCount) {
-            throw new Exception\PublishException(
-                    sprintf('Failed to publish message; required %s for success, achieved %s. Errors were: %s', $this->pubSuccessCount, $success, implode(', ', $errors))
-                    );
-        }
-        
+        $this->publisher->publish($topic, $msg);
+
         return $this;
     }    
     
@@ -337,9 +305,6 @@ class nsqphp
         // to fetch messages from for this topic/channel
 
         $hosts = $this->nsLookup->lookupHosts($topic);
-        if ($this->logger) {
-            $this->logger->debug("Found the following hosts for topic \"$topic\": " . implode(',', $hosts));
-        }
 
         foreach ($hosts as $host) {
             $parts = explode(':', $host);
@@ -351,9 +316,7 @@ class nsqphp
                     $this->readWaitTimeout,
                     TRUE    // non-blocking
                     );
-            if ($this->logger) {
-                $this->logger->info("Connecting to {$host} and saying hello");
-            }
+
             $conn->write($this->writer->magic());
             $this->subConnectionPool->add($conn);
             $socket = $conn->getSocket();
@@ -377,6 +340,8 @@ class nsqphp
      */
     public function run($timeout = 0)
     {
+        $this->running = true;
+
         if ($timeout > 0) {
             $that = $this;
             $this->loop->addTimer($timeout, function () use ($that) {
@@ -391,6 +356,7 @@ class nsqphp
      */
     public function stop()
     {
+        $this->running = false;
         $this->loop->stop();
     }
     
@@ -407,77 +373,39 @@ class nsqphp
         $connection = $this->subConnectionPool->find($socket);
         $frame = $this->reader->readFrame($connection);
 
-        if ($this->logger) {
-            $this->logger->debug(sprintf('Read frame for topic=%s channel=%s [%s] %s', $topic, $channel, (string)$connection, json_encode($frame)));
-        }
-
         // intercept errors/responses
         if ($this->reader->frameIsHeartbeat($frame)) {
-            if ($this->logger) {
-                $this->logger->debug(sprintf('HEARTBEAT [%s]', (string)$connection));
-            }
+            $this->dispatchEvent(Events::HEARTBEAT, new Event($topic, $channel));
             $connection->write($this->writer->nop());
         } elseif ($this->reader->frameIsMessage($frame)) {
-            $msg = Message::fromFrame($frame);
+            $message = Message::fromFrame($frame);
             
-            if ($this->dedupe !== NULL && $this->dedupe->containsAndAdd($topic, $channel, $msg)) {
-                if ($this->logger) {
-                    $this->logger->debug(sprintf('Deduplicating [%s] "%s"', (string)$connection, $msg->getId()));
-                }
-            } else {
-                try {
-                    call_user_func($callback, $msg);
-                } catch (\Exception $e) {
-                    // erase knowledge of this msg from dedupe
-                    if ($this->dedupe !== NULL) {
-                        $this->dedupe->erase($topic, $channel, $msg);
-                    }
-                    
-                    if ($this->logger) {
-                        $this->logger->warn(sprintf('Error processing [%s] "%s": %s', (string)$connection, $msg->getId(), $e->getMessage()));
-                    }
-                    // requeue message according to backoff strategy; continue
-                    if ($this->requeueStrategy !== NULL
-                            && ($delay = $this->requeueStrategy->shouldRequeue($msg)) !== NULL) {
-                        // requeue
-                        if ($this->logger) {
-                            $this->logger->debug(sprintf('Requeuing [%s] "%s" with delay "%s"', (string)$connection, $msg->getId(), $delay));
-                        }
-                        $connection->write($this->writer->requeue($msg->getId(), $delay));
-                        $connection->write($this->writer->ready(1));
-                        return;
-                    } else {
-                        if ($this->logger) {
-                            $this->logger->debug(sprintf('Not requeuing [%s] "%s"', (string)$connection, $msg->getId()));
-                        }
-                    }
+            try {
+                $this->dispatchEvent(Events::MESSAGE, $event = new MessageEvent($message, $topic, $channel));
+
+                $event->isProcessMessage() && call_user_func($callback, $message);
+                $connection->write($this->writer->finish($message->getId()));
+
+                $this->dispatchEvent(Events::MESSAGE_SUCCESS, $event);
+            } catch (\Exception $e) {
+                $this->dispatchEvent(Events::MESSAGE_ERROR, $event = new MessageErrorEvent($message, $e, $topic, $channel));
+
+                if (null !== $event->getRequeueDelay()) {
+                    $connection->write($this->writer->requeue($message->getId(), $event->getRequeueDelay()));
+                    $this->dispatchEvent(Events::MESSAGE_REQUEUE, $event);
+                } else {
+                    $connection->write($this->writer->finish($message->getId()));
+                    $this->dispatchEvent(Events::MESSAGE_DROP, $event);
                 }
             }
-            
-            // mark as done; get next on the way
-            $connection->write($this->writer->finish($msg->getId()));
-            $connection->write($this->writer->ready(1));
+
+            $this->running && $connection->write($this->writer->ready(1));
 
         } elseif ($this->reader->frameIsOk($frame)) {
-            if ($this->logger) {
-                $this->logger->debug(sprintf('Ignoring "OK" frame in SUB loop'));
-            }
+            $this->dispatchEvent(Events::OK, new Event($topic, $channel));
         } else {
             // @todo handle error responses a bit more cleverly
             throw new Exception\ProtocolException("Error/unexpected frame received: " . json_encode($frame));
         }
-    }
-    
-    /**
-     * Connection callback
-     * 
-     * @param ConnectionInterface $connection
-     */
-    public function connectionCallback(ConnectionInterface $connection)
-    {
-        if ($this->logger) {
-            $this->logger->info("Connecting to " . (string)$connection . " and saying hello");
-        }
-        $connection->write($this->writer->magic());
     }
 }

@@ -69,13 +69,6 @@ class Connection implements ConnectionInterface
      * @var boolean
      */
     private $nonBlocking;
-    
-    /**
-     * Optional on-connect callback
-     * 
-     * @var callable|NULL
-     */
-    private $connectCallback;
 
     /**
      * Socket handle
@@ -96,8 +89,6 @@ class Connection implements ConnectionInterface
      *      available before giving up (eg; duirng SUB loop)
      *      In seconds (no need to be whole numbers)
      * @param boolean $nonBlocking Put socket in non-blocking mode
-     * @param callable|NULL $connectCallback Optional on-connect callback (will
-     *      be called whenever we establish a connection)
      */
     public function __construct(
             $hostname = 'localhost',
@@ -105,8 +96,7 @@ class Connection implements ConnectionInterface
             $connectionTimeout = 3,
             $readWriteTimeout = 3,
             $readWaitTimeout = 15,
-            $nonBlocking = FALSE,
-            $connectCallback = NULL
+            $nonBlocking = FALSE
             ) {
         $this->hostname = $hostname;
         $this->port = $port ? $port : 4150;
@@ -115,22 +105,24 @@ class Connection implements ConnectionInterface
         $this->readWriteTimeoutUsec = ($readWriteTimeout - $this->readWriteTimeoutSec) * 1000000;
         $this->readWaitTimeoutSec = floor($readWaitTimeout);
         $this->readWaitTimeoutUsec = ($readWaitTimeout - $this->readWaitTimeoutSec) * 1000000;
-        $this->nonBlocking = (bool)$nonBlocking;
-        $this->connectCallback = $connectCallback;
+        $this->nonBlocking = (bool) $nonBlocking;
     }
-    
+
     /**
-     * Wait for readable
-     * 
-     * Waits for the socket to become readable (eg: have some data waiting)
-     * 
-     * @return boolean
+     * Close connection
      */
-    public function isReadable()
+    public function close()
     {
-        $read = array($socket = $this->getSocket());
-        $readable = stream_select($read, $null, $null, $this->readWaitTimeoutSec, $this->readWaitTimeoutUsec);
-        return $readable ? TRUE : FALSE;
+        if (null === $this->socket) {
+            return;
+        }
+
+        try {
+            socket_shutdown($this->socket);
+            socket_close($this->socket);
+        } catch (\Exception $e) {}
+
+        $this->socket = null;
     }
     
     /**
@@ -209,15 +201,12 @@ class Connection implements ConnectionInterface
                         "Could not connect to {$this->hostname}:{$this->port} ({$errStr} [{$errNo}])"
                         );
             }
+
             if ($this->nonBlocking) {
                 stream_set_blocking($this->socket, 0);
             }
-            
-            // on-connection callback
-            if ($this->connectCallback !== NULL) {
-                call_user_func($this->connectCallback, $this);
-            }
         }
+
         return $this->socket;
     }
     
