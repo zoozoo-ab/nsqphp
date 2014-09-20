@@ -93,6 +93,13 @@ class NsqSubscriber
         $this->connections = [];
     }
 
+    public function __destruct()
+    {
+        foreach ($this->connections as $connection) {
+            $connection->close();
+        }
+    }
+
     /**
      * @return int
      */
@@ -199,25 +206,28 @@ class NsqSubscriber
             $socket = $connection->getSocket();
             $this->connections[(int) $socket] = $connection;
             $nsq = $this;
-            $this->loop->addReadStream($socket, function ($socket) use ($nsq, $callback, $topic, $channel) {
-                $nsq->readStream($socket, $topic, $channel, $callback);
+            $this->loop->addReadStream($socket, function ($socket) use ($nsq, $connection, $callback, $topic, $channel) {
+                $nsq->readStream($connection, $topic, $channel, $callback);
+            });
+
+            $this->loop->addWriteStream($socket, function ($socket) use ($connection) {
+                $connection->writeBuffer();
             });
 
             // subscribe
-            $connection->write($this->writer->magic());
-            $connection->write($this->writer->subscribe($topic, $channel, '', ''));
-            $connection->write($this->writer->ready(1));
+            $connection->bufferData($this->writer->magic());
+            $connection->bufferData($this->writer->subscribe($topic, $channel, '', ''));
+            $connection->bufferData($this->writer->ready(1));
         }
     }
 
-    protected function readStream($socket, $topic, $channel, $callback)
+    protected function readStream($connection, $topic, $channel, $callback)
     {
-        $connection = $this->connections[(int) $socket];
         $frame = $this->reader->readFrame($connection);
 
         if ($this->reader->frameIsHeartbeat($frame)) {
             $this->dispatchEvent(Events::HEARTBEAT, new Event($topic, $channel));
-            $connection->write($this->writer->nop());
+            $connection->bufferData($this->writer->nop());
         } elseif ($this->reader->frameIsMessage($frame)) {
             $message = Message::fromFrame($frame);
             $this->dispatchMessage($connection, $message, $topic, $channel, $callback);
@@ -236,20 +246,20 @@ class NsqSubscriber
 
             if ($event->isProcessMessage()) {
                 call_user_func($callback, $message);
-                $connection->write($this->writer->finish($message->getId()));
+                $connection->bufferData($this->writer->finish($message->getId()));
                 $this->dispatchEvent(Events::MESSAGE_SUCCESS, $event);
             } else {
-                $connection->write($this->writer->finish($message->getId()));
+                $connection->bufferData($this->writer->finish($message->getId()));
                 $this->dispatchEvent(Events::MESSAGE_SKIP, $event);
             }
         } catch (\Exception $e) {
             $this->dispatchEvent(Events::MESSAGE_ERROR, $event = new MessageErrorEvent($message, $e, $topic, $channel));
 
             if (null !== $event->getRequeueDelay()) {
-                $connection->write($this->writer->requeue($message->getId(), $event->getRequeueDelay()));
+                $connection->bufferData($this->writer->requeue($message->getId(), $event->getRequeueDelay()));
                 $this->dispatchEvent(Events::MESSAGE_REQUEUE, $event);
             } else {
-                $connection->write($this->writer->finish($message->getId()));
+                $connection->bufferData($this->writer->finish($message->getId()));
                 $this->dispatchEvent(Events::MESSAGE_DROP, $event);
             }
         }
@@ -258,7 +268,7 @@ class NsqSubscriber
             $this->stop();
         }
 
-        $this->running && $connection->write($this->writer->ready(1));
+        $this->running && $connection->bufferData($this->writer->ready(1));
     }
 
     public function run()

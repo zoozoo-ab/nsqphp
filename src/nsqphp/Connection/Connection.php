@@ -62,50 +62,55 @@ class Connection implements ConnectionInterface
      * @var integer
      */
     private $readWaitTimeoutUsec;
-    
+
     /**
      * Non-blocking mode?
-     * 
+     *
      * @var boolean
      */
     private $nonBlocking;
 
     /**
      * Socket handle
-     * 
+     *
      * @var Resource|NULL
      */
     private $socket = NULL;
-    
+
+    /**
+     * @var string
+     */
+    private $buffer = '';
+
     /**
      * Constructor
-     * 
+     *
      * @param string $hostname Default localhost
      * @param integer $port Default 4150
+     * @param boolean $nonBlocking Put socket in non-blocking mode
      * @param float $connectionTimeout In seconds (no need to be whole numbers)
      * @param float $readWriteTimeout Socket timeout during active read/write
      *      In seconds (no need to be whole numbers)
      * @param float $readWaitTimeout How long we'll wait for data to become
      *      available before giving up (eg; duirng SUB loop)
      *      In seconds (no need to be whole numbers)
-     * @param boolean $nonBlocking Put socket in non-blocking mode
      */
     public function __construct(
-            $hostname = 'localhost',
-            $port = NULL,
-            $connectionTimeout = 3,
-            $readWriteTimeout = 3,
-            $readWaitTimeout = 15,
-            $nonBlocking = FALSE
-            ) {
+        $hostname = 'localhost',
+        $port = null,
+        $nonBlocking = false,
+        $connectionTimeout = 3,
+        $readWriteTimeout = 3,
+        $readWaitTimeout = 15
+    ) {
         $this->hostname = $hostname;
         $this->port = $port ? $port : 4150;
+        $this->nonBlocking = (bool) $nonBlocking;
         $this->connectionTimeout = $connectionTimeout;
         $this->readWriteTimeoutSec = floor($readWriteTimeout);
         $this->readWriteTimeoutUsec = ($readWriteTimeout - $this->readWriteTimeoutSec) * 1000000;
         $this->readWaitTimeoutSec = floor($readWaitTimeout);
         $this->readWaitTimeoutUsec = ($readWaitTimeout - $this->readWaitTimeoutSec) * 1000000;
-        $this->nonBlocking = (bool) $nonBlocking;
     }
 
     /**
@@ -134,27 +139,34 @@ class Connection implements ConnectionInterface
     */
     public function read($len)
     {
-        $null = NULL;
-        $read = array($socket = $this->getSocket());
+        $socket = $this->getSocket();
         $buffer = $data = '';
         while (strlen($data) < $len) {
-            $readable = stream_select($read, $null, $null, $this->readWriteTimeoutSec, $this->readWriteTimeoutUsec);
-            if ($readable > 0) {
-                $buffer = stream_socket_recvfrom($socket, $len);
-                if ($buffer === FALSE) {
-                    throw new SocketException("Could not read {$len} bytes from {$this->hostname}:{$this->port}");
-                } else if ($buffer == '') {
-                    throw new SocketException("Read 0 bytes from {$this->hostname}:{$this->port}");
-                }
-            } else if ($readable === 0) {
-                throw new SocketException("Timed out reading {$len} bytes from {$this->hostname}:{$this->port} after {$this->readWriteTimeoutSec} seconds and {$this->readWriteTimeoutUsec} microseconds");
-            } else {
+            $buffer = stream_socket_recvfrom($socket, $len);
+
+            if ($buffer === false) {
                 throw new SocketException("Could not read {$len} bytes from {$this->hostname}:{$this->port}");
+            } else if ($buffer == '') {
+                throw new SocketException("Read 0 bytes from {$this->hostname}:{$this->port}");
             }
+
             $data .= $buffer;
             $len -= strlen($buffer);
         }
         return $data;
+    }
+
+    public function bufferData($data)
+    {
+        $this->buffer .= $data;
+    }
+
+    public function writeBuffer()
+    {
+        if ($this->buffer) {
+            $this->write($this->buffer);
+            $this->buffer = '';
+        }
     }
 
     /**
@@ -164,26 +176,19 @@ class Connection implements ConnectionInterface
      */
     public function write($buf)
     {
-        $null = NULL;
-        $write = array($socket = $this->getSocket());
+        $socket = $this->getSocket();
 
         // keep writing until all the data has been written
         while (strlen($buf) > 0) {
-            // wait for stream to become available for writing
-            $writable = stream_select($null, $write, $null, $this->readWriteTimeoutSec, $this->readWriteTimeoutUsec);
-            if ($writable > 0) {
-                // write buffer to stream
-                $written = stream_socket_sendto($socket, $buf);
-                if ($written === -1 || $written === FALSE) {
-                    throw new SocketException("Could not write " . strlen($buf) . " bytes to {$this->hostname}:{$this->port}");
-                }
-                // determine how much of the buffer is left to write
-                $buf = substr($buf, $written);
-            } else if ($writable === 0) {
-                throw new SocketException("Timed out writing " . strlen($buf) . " bytes to {$this->hostname}:{$this->port} after {$this->readWriteTimeoutSec} seconds and {$this->readWriteTimeoutUsec} microseconds");
-            } else {
+            // write buffer to stream
+            $written = stream_socket_sendto($socket, $buf);
+
+            if ($written === -1 || $written === false) {
                 throw new SocketException("Could not write " . strlen($buf) . " bytes to {$this->hostname}:{$this->port}");
             }
+
+            // determine how much of the buffer is left to write
+            $buf = substr($buf, $written);
         }
     }
     
@@ -194,12 +199,11 @@ class Connection implements ConnectionInterface
      */
     public function getSocket()
     {
-        if ($this->socket === NULL) {
+        if (null === $this->socket) {
             $this->socket = fsockopen($this->hostname, $this->port, $errNo, $errStr, $this->connectionTimeout);
-            if ($this->socket === FALSE) {
-                throw new ConnectionException(
-                        "Could not connect to {$this->hostname}:{$this->port} ({$errStr} [{$errNo}])"
-                        );
+
+            if (false === $this->socket) {
+                throw new ConnectionException("Could not connect to {$this->hostname}:{$this->port} ({$errStr} [{$errNo}])");
             }
 
             if ($this->nonBlocking) {
