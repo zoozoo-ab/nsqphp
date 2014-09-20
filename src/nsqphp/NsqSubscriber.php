@@ -208,8 +208,6 @@ class NsqSubscriber
             $connection->write($this->writer->subscribe($topic, $channel, '', ''));
             $connection->write($this->writer->ready(1));
         }
-
-        $this->run();
     }
 
     protected function readStream($socket, $topic, $channel, $callback)
@@ -263,7 +261,7 @@ class NsqSubscriber
         $this->running && $connection->write($this->writer->ready(1));
     }
 
-    protected function run()
+    public function run()
     {
         $this->running = true;
 
@@ -277,7 +275,7 @@ class NsqSubscriber
         $this->loop->run();
     }
 
-    protected function stop()
+    public function stop()
     {
         $this->running = false;
         $this->loop->stop();
